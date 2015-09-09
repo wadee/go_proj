@@ -1,8 +1,14 @@
 CREATE TABLE user_geo (
-  uid SERIAL NOT NULL AUTO_INCREMENT COMMENT '用户ID',
-  user_name VARCHAR(32) NOT NULL DEFAULT '' COMMENT '用户名称',
+  uid SERIAL NOT NULL,
+  user_name VARCHAR(32) NOT NULL DEFAULT '',
   geom GEOMETRY(Point, 4326),
-  insert_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
-  update_time timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  insert_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (uid)
 );
+
+CREATE INDEX geo_gix ON user_geo USING GIST (geom); 
+
+INSERT INTO user_geo (user_name, geom) VALUES ('tom', ST_GeomFromText('POINT(0 0)', 4326));
+
+SELECT uid, user_name FROM user_geo WHERE ST_DWithin(geom, ST_GeomFromText('POINT(0 0)', 4326),1000); 
