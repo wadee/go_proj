@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	_ "github.com/lib/pq"
+	"math/rand"
 	"time"
 )
 
@@ -31,10 +32,10 @@ func main() {
 	}
 
 	//插入数据
-	stmt, err := db.Prepare("INSERT INTO user_geo(user_name,geom) VALUES( 'lucy', ST_GeomFromText('POINT(0 10)', 4326)) RETURNING uid")
+	stmt, err := db.Prepare("INSERT INTO user_geo(user_name,geom) VALUES($1, ST_GeomFromText($2, 4326)) RETURNING uid")
 	checkErr(err)
 
-	res, err := stmt.Exec()
+	res, err := stmt.Exec("tommy", "POINT(10 21)")
 	fmt.Println(res)
 	checkErr(err)
 
@@ -89,6 +90,24 @@ func main() {
 
 	db.Close()
 
+}
+
+func getRandomLatLng() (lat, lng float64) {
+	// var lat float64
+	// var lng float64
+
+	if rand.Seed(time.Now().Unix()); rand.Intn(2) == 0 {
+		lng = (rand.Float64() * 170)
+	} else {
+		lng = (rand.Float64() * 170) - 170
+	}
+	if rand.Seed(time.Now().Unix() + 78); rand.Intn(2) == 0 {
+		lat = (rand.Float64() * 80)
+	} else {
+		lat = (rand.Float64() * 80) - 80
+	}
+
+	return
 }
 
 func checkErr(err error) {
