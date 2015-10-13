@@ -11,7 +11,29 @@
 #include <err.h>
 
 #define SERVER_PORT 8080
+#define IS_UDP(x) (x == udp_transport)
 int debug = 0;
+
+enum network_transport {
+    local_transport, /* Unix sockets*/
+    tcp_transport,
+    udp_transport
+};
+
+enum conn_states {
+    conn_listening,  /**< the socket which listens for connections */
+    conn_new_cmd,    /**< Prepare connection for next command */
+    conn_waiting,    /**< waiting for a readable socket */
+    conn_read,       /**< reading in a command line */
+    conn_parse_cmd,  /**< try to parse a command from the input buffer */
+    conn_write,      /**< writing out a simple response */
+    conn_nread,      /**< reading in a fixed number of bytes */
+    conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
+    conn_closing,    /**< closing this connection */
+    conn_mwrite,     /**< writing out many items sequentially */
+    conn_closed,     /**< connection is closed */
+    conn_max_state   /**< Max state value (used for assertion) */
+};
 
 typedef struct{
     int read_fd;
@@ -30,6 +52,8 @@ struct conn {
     int stats;
     //struct event event. libevent注册事件,放在连接体本身作为一个属性存起来
     struct event event;
+    //libevent 的回调函数的第二个参数，表示触发的事件
+    short  which;
     //连接管理，连接池嘛，所以可以是一个链表，之后需要涉及到链表的增删改查
     conn * next;
 };
@@ -163,6 +187,13 @@ static int server_socket(const char *interface,
                          enum network_transport transport,
                          FILE *portnumber_file){
 
+    /*
+        该函数主要作用：
+        1.监听端口，注册监听端口事件.
+        2.一旦有端口有数据，建立连接，将连接放到连接池中，conn_new为每一个连接注册时间监听
+        3.通知线程有连接需要处理
+    */
+
     int sfd;
     struct linger ling = {0, 0};
     struct addrinfo *ai;
@@ -174,7 +205,7 @@ static int server_socket(const char *interface,
     int success = 0;
     int flags =1;
 
-    hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
+    hints.ai_socktype = SOCK_STREAM;
 
     if (port == -1) {
         port = 0;
@@ -204,21 +235,18 @@ static int server_socket(const char *interface,
         }
 
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-        if (IS_UDP(transport)) {
-            maximize_sndbuf(sfd);
-        } else {
-            error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
+        
+        error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+        if (error != 0)
+            perror("setsockopt");
 
-            error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-            if (error != 0)
-                perror("setsockopt");
+        error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+        if (error != 0)
+            perror("setsockopt");
 
-            error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
-        }
+        error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+        if (error != 0)
+            perror("setsockopt");
 
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             if (errno != EADDRINUSE) {
@@ -231,7 +259,7 @@ static int server_socket(const char *interface,
             continue;
         } else {
             success++;
-            if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
+            if (!IS_UDP(transport) && listen(sfd, 1024) == -1) {
                 perror("listen()");
                 close(sfd);
                 freeaddrinfo(ai);
@@ -278,6 +306,59 @@ static int server_socket(const char *interface,
 
 }
 
+void event_handler(const int fd, const short which, void *arg) {
+    conn *c;
+    c = (conn *)arg;
+
+    assert(c != NULL);
+    c->which = which;
+
+    if (fd != c->sfd)
+    {
+        perror("fd != sfd");
+        conn_close(c);
+        return;
+    }
+
+
+}
+
+static void conn_close(conn *c) {
+    /*
+        清理工作：
+            1.libevent事件删除
+            2.c中的sfd的关闭
+            3.conn的链表删除
+            4.c的释放。(有可能不释放，如果是唯一一个的话，猜测的)
+    */
+    assert(c != NULL);
+    /* delete the event, the socket and the conn */
+    event_del(&c->event);
+
+    fprintf(stderr, "<%d connection closed.\n", c->sfd);
+    // conn_cleanup(c);
+    // MEMCACHED_CONN_RELEASE(c->sfd);
+    conn_set_state(c, conn_closed);
+    close(c->sfd);
+    return;
+}
+
+
+static void conn_set_state(conn *c, enum conn_states state) {
+    assert(c != NULL);
+    assert(state >= conn_listening && state < conn_max_state);
+
+    if (state != c->state) {
+        fprintf(stderr, "error\n");
+
+        if (state == conn_write || state == conn_mwrite) {
+            // MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+            //i don't know what should be done.
+        }
+        c->state = state;
+    }
+}
+
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
@@ -310,21 +391,25 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
 }
 
-int main(int argc, char** argv){
-
+int main(int argc, char** argv){    
     /*
         主线程主体流程：
         conn_init;
         thread_init;
     
-        accept 请求，分发
+        server_socket 请求，分发
         注册事件loop    
     */
-    conn_init();
+    FILE *portnumber_file = NULL;
+    portnumber_file = fopen("/tmp/portnumber.file", "a");
+
+    // conn_init();
     thread_init();
 
-    
+    server_socket(SERVER_PORT, tcp_transport, portnumber_file);
 
+    event_base_loop(main_base, 0);
 
+    exit(0);
 
 }
