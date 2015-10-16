@@ -12,7 +12,30 @@
 
 #define SERVER_PORT 8080
 #define IS_UDP(x) (x == udp_transport)
+#define ITEM_UPDATE_INTERVAL 60
 int debug = 0;
+
+#define ITEMS_PER_ALLOC 64
+#define DATA_BUFFER_SIZE 2048
+#define NUM_OF_THREADS 4
+#define MAX_CONNS 10
+/* An item in the connection queue. */
+typedef struct conn_queue_item CQ_ITEM;
+struct conn_queue_item {
+    int               sfd;
+    enum conn_states  init_state;
+    int               event_flags;
+    int               read_buffer_size;
+    enum network_transport     transport;
+    CQ_ITEM          *next;
+};
+
+typedef struct conn_queue CQ;
+struct conn_queue {
+    CQ_ITEM *head;
+    CQ_ITEM *tail;
+    pthread_mutex_t lock;
+};
 
 enum network_transport {
     local_transport, /* Unix sockets*/
@@ -35,12 +58,49 @@ enum conn_states {
     conn_max_state   /**< Max state value (used for assertion) */
 };
 
+struct stats {
+    pthread_mutex_t mutex;
+    unsigned int  curr_items;
+    unsigned int  total_items;
+    uint64_t      curr_bytes;
+    unsigned int  curr_conns;
+    unsigned int  total_conns;
+    uint64_t      rejected_conns;
+    uint64_t      malloc_fails;
+    unsigned int  reserved_fds;
+    unsigned int  conn_structs;
+    uint64_t      get_cmds;
+    uint64_t      set_cmds;
+    uint64_t      touch_cmds;
+    uint64_t      get_hits;
+    uint64_t      get_misses;
+    uint64_t      touch_hits;
+    uint64_t      touch_misses;
+    uint64_t      evictions;
+    uint64_t      reclaimed;
+    time_t        started;          /* when the process was started */
+    bool          accepting_conns;  /* whether we are currently accepting */
+    uint64_t      listen_disabled_num;
+    unsigned int  hash_power_level; /* Better hope it's not over 9000 */
+    uint64_t      hash_bytes;       /* size used for hash tables */
+    bool          hash_is_expanding; /* If the hash table is being expanded */
+    uint64_t      expired_unfetched; /* items reclaimed but never touched */
+    uint64_t      evicted_unfetched; /* items evicted but never touched */
+    bool          slab_reassign_running; /* slab reassign in progress */
+    uint64_t      slabs_moved;       /* times slabs were moved around */
+    uint64_t      lru_crawler_starts; /* Number of item crawlers kicked off */
+    bool          lru_crawler_running; /* crawl in progress */
+    uint64_t      lru_maintainer_juggles; /* number of LRU bg pokes */
+};
+
 typedef struct{
     int read_fd;
     int write_fd;
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
     struct event notify_event; 
+    short  ev_flags; //H
+    struct conn_queue *new_conn_queue;
 } thread_cg;
 
 typedef struct conn conn;
@@ -52,24 +112,52 @@ struct conn {
     int stats;
     //struct event event. libevent注册事件,放在连接体本身作为一个属性存起来
     struct event event;
+    //收到的数据
+    char *req;
+
+    struct bufferevent *buf_ev;
     //libevent 的回调函数的第二个参数，表示触发的事件
     short  which;
     //连接管理，连接池嘛，所以可以是一个链表，之后需要涉及到链表的增删改查
     conn * next;
 };
 
+
+
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static conn *listen_conn = NULL;
 conn **conns;
 
+static CQ_ITEM *cqi_freelist;
+
+static int last_thread = -1;
+static int max_fds;
+struct stats stats;
 static thread_cg *thread_cgs;
 static int init_count = 0;
 static pthread_mutex_t init_lock;
 static pthread_cond_t init_cond;
+static volatile bool allow_new_conns = true;
+static struct event maxconnsevent;
+static pthread_mutex_t cqi_freelist_lock;
+
+pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void STATS_LOCK() {
+    pthread_mutex_lock(&stats_lock);
+}
+
+void STATS_UNLOCK() {
+    pthread_mutex_unlock(&stats_lock);
+}
 
 int thread_init(int num_of_threads){
     int i;
     pthread_mutex_init(&init_lock, NULL);
     pthread_cond_init(&init_cond, NULL);
+    pthread_mutex_init(&cqi_freelist_lock, NULL);
+    cqi_freelist = NULL;
 
     thread_cgs = calloc(num_of_threads, sizeof(thread_cg));
 
@@ -173,10 +261,26 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     switch(buf[0]){
         case 'c':
             //从连接管理中，pop出来一个连接，将连接(conn_new)注册到event_handler来处理
-
+            item = cq_pop(me->new_conn_queue);
+            if (NULL != item) {
+                conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
+                                   item->read_buffer_size, item->transport, me->base);
+                if (c == NULL) {
+                    if (IS_UDP(item->transport)) {
+                        fprintf(stderr, "Can't listen for events on UDP socket\n");
+                        exit(1);
+                    } else {
+                            fprintf(stderr, "Can't listen for events on fd %d\n",
+                                item->sfd);
+                        close(item->sfd);
+                    }
+                } else {
+                    c->thread = me;
+                }
+                cqi_free(item);
+            }
             break;
         case 'p':
-            //
             break;
     }
 
@@ -306,12 +410,16 @@ static int server_socket(const char *interface,
 
 }
 
-void event_handler(const int fd, const short which, void *arg) {
+// void event_handler(const int fd, const short which, void *arg) {
+// 改成用bufferevent之后，接受的参数得改。。。
+void event_handler(struct bufferevent *incoming, void *arg) {
     conn *c;
     c = (conn *)arg;
 
     assert(c != NULL);
     c->which = which;
+    int fd;
+    fd = (int)bufferevent_getfd(incoming);
 
     if (fd != c->sfd)
     {
@@ -319,8 +427,278 @@ void event_handler(const int fd, const short which, void *arg) {
         conn_close(c);
         return;
     }
+    drive_machine(c);
+    return;
 
+}
 
+//void drive_machine(conn* c){
+//改成bufferevent之后event_handler和drive_machine都不能幸免需要改参数
+void drive_machine(conn* c, struct bufferevent * incoming){
+    assert(c != NULL);
+    // 真正的处理函数，根据不同的conn的状态来进行不同的处理。
+    // 虽然我做这个demo只是把消息回显而已，但貌似这么多种状态还是得处理。
+    bool stop = false;
+    int sfd;
+
+    struct sockaddr_storage addr;
+    struct evbuffer *evreturn;
+    char *req;
+
+    while(!stop){
+        switch(c->stats){
+            case conn_listening:
+                //如果是listenting状态，则需要把连接accept
+                addrlen = sizeof(addr);
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+                if (sfd == -1)
+                {
+                    // accept错误
+                    perror("sfd accept failed");
+                    accept_new_conns(false); //用来决定主线程是否还需要accept连接，如果已经接近饱和了，就停住，等一个时间间隔再来试。
+                    stop = true;
+                }
+                //分派conn任务
+                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                     DATA_BUFFER_SIZE, tcp_transport);
+                stop = true;
+                break;
+            case conn_new_cmd:
+                /* fall through */
+            case conn_read:
+                /*  now try reading from the socket */
+                req = evbuffer_readline(incoming->input); 
+                if (req == NULL){
+                    //conn_set_state(c, conn_closing);
+                    goto set_conn_closing;
+                    break;    
+                }
+                if(c->req != NULL){
+                    free(c->req);
+                    c->req = NULL;
+                }
+                c->req = req;
+                conn_set_state(c, conn_mwrite);
+                break;
+                //把req存起来哈。。。
+                //先不回复吧。。。。回复在conn_mwrite里面呢..      
+                //evreturn = evbuffer_new();
+                //evbuffer_add_printf(evreturn, "You said %s\n", req);
+               // bufferevent_write_buffer(incoming, evreturn);
+                //evbuffer_free(evreturn);
+                //free(req);
+
+            set_conn_closing: 
+                conn_set_state(c, conn_closing);
+                break;
+            case conn_mwrite:
+                //所有的回复到在这个函数进行输出
+                req = c->req;
+                evreturn = evbuffer_new();
+                evbuffer_add_printf(evreturn, "You said %s\n", req);
+                bufferevent_write_buffer(incoming, evreturn);
+                evbuffer_free(evreturn);
+                free(req);
+                c->req = NULL;
+                conn_set_state(c,conn_waiting);
+                break;
+            case conn_waiting:
+                if (!update_event(c, EV_READ | EV_PERSIST)) {
+                    fprintf(stderr, "Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+                conn_set_state(c, conn_read);
+                stop = true;
+                break;
+            case conn_closing:
+                if (IS_UDP(c->transport))
+                    conn_cleanup(c);
+                else
+                    conn_close(c);
+                stop = true;
+                break;
+                }
+                /* otherwise we have a real error, on which we close the connection */
+
+        }
+
+    }
+
+}
+
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
+                       int read_buffer_size, enum network_transport transport) {
+    CQ_ITEM *item = cqi_new();
+    char buf[1];
+    if (item == NULL) {
+        close(sfd);
+        /* given that malloc failed this may also fail, but let's try */
+        fprintf(stderr, "Failed to allocate memory for connection object\n");
+        return ;
+    }
+
+    int tid = (last_thread + 1) % NUM_OF_THREADS;
+
+    thread_cg *thread = threads + tid;
+
+    last_thread = tid;
+
+    item->sfd = sfd;
+    item->init_state = init_state;
+    item->event_flags = event_flags;
+    item->read_buffer_size = read_buffer_size;
+    item->transport = transport;
+
+    //thread里面的new_conn_queue的属性原来这个才是每一个线程的连接管理池好么……
+    cq_push(thread->new_conn_queue, item);
+
+    // MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
+    buf[0] = 'c';
+    if (write(thread->read_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
+}
+
+static CQ_ITEM *cqi_new(void) {
+    CQ_ITEM *item = NULL;
+    pthread_mutex_lock(&cqi_freelist_lock);
+    if (cqi_freelist) {
+        item = cqi_freelist;
+        cqi_freelist = item->next;
+    }
+    pthread_mutex_unlock(&cqi_freelist_lock);
+
+    if (NULL == item) {
+        int i;
+
+        /* Allocate a bunch of items at once to reduce fragmentation */
+        item = malloc(sizeof(CQ_ITEM) * ITEMS_PER_ALLOC);
+        if (NULL == item) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return NULL;
+        }
+
+        /*
+         * Link together all the new items except the first one
+         * (which we'll return to the caller) for placement on
+         * the freelist.
+         */
+        for (i = 2; i < ITEMS_PER_ALLOC; i++)
+            item[i - 1].next = &item[i];
+
+        pthread_mutex_lock(&cqi_freelist_lock);
+        item[ITEMS_PER_ALLOC - 1].next = cqi_freelist;
+        cqi_freelist = &item[1];
+        pthread_mutex_unlock(&cqi_freelist_lock);
+    }
+
+    return item;
+}
+
+static void cq_push(CQ *cq, CQ_ITEM *item) {
+    item->next = NULL;
+
+    pthread_mutex_lock(&cq->lock);
+    if (NULL == cq->tail)
+        cq->head = item;
+    else
+        cq->tail->next = item;
+    cq->tail = item;
+    pthread_mutex_unlock(&cq->lock);
+}
+
+static CQ_ITEM *cq_pop(CQ *cq) {
+    CQ_ITEM *item;
+
+    pthread_mutex_lock(&cq->lock);
+    item = cq->head;
+    if (NULL != item) {
+        cq->head = item->next;
+        if (NULL == cq->head)
+            cq->tail = NULL;
+    }
+    pthread_mutex_unlock(&cq->lock);
+
+    return item;
+}
+
+static void cqi_free(CQ_ITEM *item) {
+    pthread_mutex_lock(&cqi_freelist_lock);
+    item->next = cqi_freelist;
+    cqi_freelist = item;
+    pthread_mutex_unlock(&cqi_freelist_lock);
+}
+
+void accept_new_conns(const bool do_accept) {
+    //这个函数貌似很重要呀，控制主线程现在还要不要accept连接了
+    pthread_mutex_lock(&conn_lock);
+    do_accept_new_conns(do_accept);
+    pthread_mutex_unlock(&conn_lock);
+}
+
+void do_accept_new_conns(const bool do_accept) {
+    conn *next;
+    //update_event 表示将监听事件更改，0表示不监听？应该是吧。H
+
+    for (next = listen_conn; next; next = next->next) {
+        if (do_accept) {
+            update_event(next, EV_READ | EV_PERSIST);
+            if (listen(next->sfd, settings.backlog) != 0) {
+                perror("listen");
+            }
+        }
+        else {
+            update_event(next, 0);
+            if (listen(next->sfd, 0) != 0) {
+                perror("listen");
+            }
+        }
+    }
+
+    if (do_accept) {
+        STATS_LOCK();
+        stats.accepting_conns = true;
+        STATS_UNLOCK();
+    } else {
+        STATS_LOCK();
+        stats.accepting_conns = false;
+        stats.listen_disabled_num++;
+        STATS_UNLOCK();
+        allow_new_conns = false;
+        //倒计时，重新调用accept_new_conns来将conns重新注册监听事件
+        maxconns_handler(-42, 0, 0);
+    }
+}
+
+static void maxconns_handler(const int fd, const short which, void *arg) {
+    struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
+
+    if (fd == -42 || allow_new_conns == false) {
+        /* reschedule in 10ms if we need to keep polling */
+        evtimer_set(&maxconnsevent, maxconns_handler, 0);
+        event_base_set(main_base, &maxconnsevent);
+        evtimer_add(&maxconnsevent, &t);
+    } else {
+        evtimer_del(&maxconnsevent);
+        accept_new_conns(true);
+    }
+}
+
+static bool update_event(conn *c, const int new_flags) {
+    assert(c != NULL);
+
+    struct event_base *base = c->event.ev_base;
+    if (c->ev_flags == new_flags)
+        return true;
+    if (event_del(&c->event) == -1) return false;
+    event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
+    event_base_set(base, &c->event);
+    c->ev_flags = new_flags;
+    if (event_add(&c->event, 0) == -1) return false;
+    return true;
 }
 
 static void conn_close(conn *c) {
@@ -384,11 +762,67 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     new_c->stats = init_state;
     //以上是连接的初始化，接下来是连接的事件注册
-    event_set(&new_c->event, sfd, event_flags, event_handler, (void*)new_c);
-    event_base_set(base, &new_c->event);
+    /*
+     event_set(&new_c->event, sfd, event_flags, event_handler, (void*)new_c);
+     event_base_set(base, &new_c->event);
+     想着想着还是决定改成用bufferevent。
+     因为master线程与slave用的是同一个函数来做处理event_handler -> drive_machine，
+     所以master线程的accept也需要改为用bufferevent，而且event_handler以及drive_machine也得改
+     还有struct conn的event也得改呀，得改成bufferevent类型呢
+     */
+    new_c->buf_ev = bufferevent_new(sfd, event_handler, event_handler, event_handler, (void *)new_c);
+    bufferevent_enable(new_c->buf_ev, event_flags);
+    bufferevent_base_set(base, new_c->buf_ev);
 
     return new_c;
 
+}
+
+static void conn_init(void) {
+    /* We're unlikely to see an FD much higher than maxconns. */
+    int next_fd = dup(1);
+    int headroom = 10;      /* account for extra unexpected open FDs */
+    struct rlimit rl;
+
+    max_fds = MAX_CONNS + headroom + next_fd;
+
+    /* But if possible, get the actual highest FD we can possibly ever see. */
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        max_fds = rl.rlim_max;
+    } else {
+        fprintf(stderr, "Failed to query maximum file descriptor; "
+                "falling back to maxconns\n");
+    }
+
+    close(next_fd);
+
+    if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
+        fprintf(stderr, "Failed to allocate connection structures\n");
+        /* This is unrecoverable so bail out early. */
+        exit(1);
+    }
+}
+
+static void stats_init(void) {
+    stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
+    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = 0;
+    stats.touch_cmds = stats.touch_misses = stats.touch_hits = stats.rejected_conns = 0;
+    stats.malloc_fails = 0;
+    stats.curr_bytes = stats.listen_disabled_num = 0;
+    stats.hash_power_level = stats.hash_bytes = stats.hash_is_expanding = 0;
+    stats.expired_unfetched = stats.evicted_unfetched = 0;
+    stats.slabs_moved = 0;
+    stats.lru_maintainer_juggles = 0;
+    stats.accepting_conns = true; /* assuming we start in this state. */
+    stats.slab_reassign_running = false;
+    stats.lru_crawler_running = false;
+    stats.lru_crawler_starts = 0;
+
+    /* make the time we started always be 2 seconds before we really
+       did, so time(0) - time.started is never zero.  if so, things
+       like 'settings.oldest_live' which act as booleans as well as
+       values are now false in boolean context... */
+    process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;    // stats_prefix_init();
 }
 
 int main(int argc, char** argv){    
@@ -396,14 +830,18 @@ int main(int argc, char** argv){
         主线程主体流程：
         conn_init;
         thread_init;
+        还得有一个
+        stat_init
+        stats的结构是用来记录当前的状态的，stats是一个静态变量
     
         server_socket 请求，分发
-        注册事件loop    
+        注册事件loop
     */
     FILE *portnumber_file = NULL;
     portnumber_file = fopen("/tmp/portnumber.file", "a");
 
-    // conn_init();
+    stats_init();
+    conn_init();
     thread_init();
 
     server_socket(SERVER_PORT, tcp_transport, portnumber_file);
