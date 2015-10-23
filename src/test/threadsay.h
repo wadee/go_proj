@@ -1,4 +1,21 @@
-#define SERVER_PORT 8080
+#include <event.h>
+#include <sys/types.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <pthread.h>
+
+
+#define SERVER_PORT 8081
+#define EX_OSERR 71
 #define IS_UDP(x) (x == udp_transport)
 #define ITEM_UPDATE_INTERVAL 60
 int debug = 0;
@@ -7,24 +24,12 @@ int debug = 0;
 #define DATA_BUFFER_SIZE 2048
 #define NUM_OF_THREADS 4
 #define MAX_CONNS 10
+
+typedef struct {
+    pthread_t thread_id;        /* unique ID of this thread */
+    struct event_base *base;    /* libevent handle this thread uses */
+} LIBEVENT_DISPATCHER_THREAD;
 /* An item in the connection queue. */
-typedef struct conn_queue_item CQ_ITEM;
-struct conn_queue_item {
-    int               sfd;
-    enum conn_states  init_state;
-    int               event_flags;
-    int               read_buffer_size;
-    enum network_transport     transport;
-    CQ_ITEM          *next;
-};
-
-typedef struct conn_queue CQ;
-struct conn_queue {
-    CQ_ITEM *head;
-    CQ_ITEM *tail;
-    pthread_mutex_t lock;
-};
-
 enum network_transport {
     local_transport, /* Unix sockets*/
     tcp_transport,
@@ -45,6 +50,25 @@ enum conn_states {
     conn_closed,     /**< connection is closed */
     conn_max_state   /**< Max state value (used for assertion) */
 };
+
+typedef struct conn_queue_item CQ_ITEM;
+struct conn_queue_item {
+    int               sfd;
+    enum conn_states  init_state;
+    int               event_flags;
+    int               read_buffer_size;
+    enum network_transport     transport;
+    CQ_ITEM          *next;
+};
+
+typedef struct conn_queue CQ;
+struct conn_queue {
+    CQ_ITEM *head;
+    CQ_ITEM *tail;
+    pthread_mutex_t lock;
+};
+
+
 
 struct stats {
     pthread_mutex_t mutex;
@@ -97,13 +121,15 @@ struct conn {
     //首先应该是文件描述符
     int sfd;
     //此连接目前的状态，因为我们需要根据不同的状态进行不同的处理
-    int stats;
+    int state;
     //struct event event. libevent注册事件,放在连接体本身作为一个属性存起来
     struct event event;
     //收到的数据
     char *req;
-
+    short  ev_flags;
     struct bufferevent *buf_ev;
+
+    thread_cg *thread;
     //libevent 的回调函数的第二个参数，表示触发的事件
     short  which;
     //连接管理，连接池嘛，所以可以是一个链表，之后需要涉及到链表的增删改查
@@ -122,9 +148,13 @@ static int server_socket(const char *interface,
                          enum network_transport transport,
                          FILE *portnumber_file);
 void event_handler(struct bufferevent *incoming, void *arg);
+
+void master_event_handler(const int fd, const short which, void *arg);
+
 void drive_machine(conn* c, struct bufferevent * incoming);
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport);
+static void cq_init(CQ *cq);
 static CQ_ITEM *cqi_new(void);
 static void cq_push(CQ *cq, CQ_ITEM *item);
 static CQ_ITEM *cq_pop(CQ *cq);

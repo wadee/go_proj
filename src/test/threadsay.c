@@ -1,15 +1,7 @@
 #include "threadsay.h"
-#include <event.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <err.h>
+#include <sys/resource.h>
+#include <assert.h>
 
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -28,6 +20,8 @@ static pthread_cond_t init_cond;
 static volatile bool allow_new_conns = true;
 static struct event maxconnsevent;
 static pthread_mutex_t cqi_freelist_lock;
+static struct event_base *main_base;
+static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
 
 pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -52,6 +46,8 @@ int thread_init(int num_of_threads){
         perror("can't alloc thread_cg");
         exit(1);
     }
+    dispatcher_thread.base = main_base;
+    dispatcher_thread.thread_id = pthread_self();
 
     for(i = 0; i < num_of_threads; i++){
         int fds[2];
@@ -69,6 +65,12 @@ int thread_init(int num_of_threads){
     for(i = 0; i < num_of_threads; i++){
         start_worker(worker_libevent, &thread_cgs[i]);
     }
+
+    pthread_mutex_lock(&init_lock);
+    while (init_count < NUM_OF_THREADS) {
+        pthread_cond_wait(&init_cond, &init_lock);
+    }
+    pthread_mutex_unlock(&init_lock);
 
 }
 
@@ -110,12 +112,14 @@ int setup_thread(thread_cg * t_cg){
         fprintf(stderr, "Can't monitor libevent notify pipe\n");
         exit(1);
     }
-    //未完成，应该还是需要实现连接管理的
-    pthread_mutex_lock(&init_lock);
-    while (init_count < num_of_threads) {
-        pthread_cond_wait(&init_cond, &init_lock);
+    t_cg->new_conn_queue = malloc(sizeof(struct conn_queue));
+    if (t_cg->new_conn_queue == NULL) {
+        perror("Failed to allocate memory for connection queue");
+        exit(EXIT_FAILURE);
     }
-    pthread_mutex_unlock(&init_lock);
+    cq_init(t_cg->new_conn_queue);
+    //未完成，应该还是需要实现连接管理的
+    
 }
 
 static int new_socket(struct addrinfo *ai) {
@@ -138,6 +142,7 @@ static int new_socket(struct addrinfo *ai) {
 static void thread_libevent_process(int fd, short which, void *arg) {   
     thread_cg *me = arg;
     char buf[1];
+    CQ_ITEM *item;
 
     if (read(fd, buf, 1) != 1)
     {
@@ -239,6 +244,7 @@ static int server_socket(const char *interface,
         if (error != 0)
             perror("setsockopt");
 
+
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             if (errno != EADDRINUSE) {
                 perror("bind()");
@@ -297,14 +303,31 @@ static int server_socket(const char *interface,
 
 }
 
-// void event_handler(const int fd, const short which, void *arg) {
+
+void master_event_handler(const int fd, const short which, void *arg) {
+    conn *c;
+    c = (conn *)arg;
+
+    assert(c != NULL);
+    // c->which = which;
+
+    if (fd != c->sfd)
+    {
+        perror("fd != sfd");
+        conn_close(c);
+        return;
+    }
+    drive_machine(c, NULL);
+    return;
+}
+
 // 改成用bufferevent之后，接受的参数得改。。。
 void event_handler(struct bufferevent *incoming, void *arg) {
     conn *c;
     c = (conn *)arg;
 
     assert(c != NULL);
-    c->which = which;
+    // c->which = which;
     int fd;
     fd = (int)bufferevent_getfd(incoming);
 
@@ -314,9 +337,17 @@ void event_handler(struct bufferevent *incoming, void *arg) {
         conn_close(c);
         return;
     }
-    drive_machine(c);
+    drive_machine(c, incoming);
     return;
 
+}
+
+void buf_error_callback(struct bufferevent *incoming,
+                        short what,
+                        void *arg)
+{
+    int sfd = (int)bufferevent_getfd(incoming);
+    printf("error %d and %d", sfd, what);
 }
 
 //void drive_machine(conn* c){
@@ -328,12 +359,13 @@ void drive_machine(conn* c, struct bufferevent * incoming){
     bool stop = false;
     int sfd;
 
+    socklen_t addrlen;
     struct sockaddr_storage addr;
     struct evbuffer *evreturn;
     char *req;
 
     while(!stop){
-        switch(c->stats){
+        switch(c->state){
             case conn_listening:
                 //如果是listenting状态，则需要把连接accept
                 addrlen = sizeof(addr);
@@ -399,18 +431,12 @@ void drive_machine(conn* c, struct bufferevent * incoming){
                 stop = true;
                 break;
             case conn_closing:
-                if (IS_UDP(c->transport))
-                    conn_cleanup(c);
-                else
-                    conn_close(c);
+                conn_close(c);
                 stop = true;
                 break;
-                }
+            }
                 /* otherwise we have a real error, on which we close the connection */
-
         }
-
-    }
 
 }
 
@@ -427,7 +453,7 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
 
     int tid = (last_thread + 1) % NUM_OF_THREADS;
 
-    thread_cg *thread = threads + tid;
+    thread_cg *thread = thread_cgs + tid;
 
     last_thread = tid;
 
@@ -442,7 +468,7 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
 
     // MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
     buf[0] = 'c';
-    if (write(thread->read_fd, buf, 1) != 1) {
+    if (write(thread->write_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
     }
 }
@@ -512,6 +538,12 @@ static CQ_ITEM *cq_pop(CQ *cq) {
     return item;
 }
 
+static void cq_init(CQ *cq) {
+    pthread_mutex_init(&cq->lock, NULL);
+    cq->head = NULL;
+    cq->tail = NULL;
+}
+
 static void cqi_free(CQ_ITEM *item) {
     pthread_mutex_lock(&cqi_freelist_lock);
     item->next = cqi_freelist;
@@ -533,7 +565,7 @@ void do_accept_new_conns(const bool do_accept) {
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
             update_event(next, EV_READ | EV_PERSIST);
-            if (listen(next->sfd, settings.backlog) != 0) {
+            if (listen(next->sfd, 32) != 0) {
                 perror("listen");
             }
         }
@@ -577,15 +609,45 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
 static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
-    struct event_base *base = c->event.ev_base;
+    
     if (c->ev_flags == new_flags)
         return true;
-    if (event_del(&c->event) == -1) return false;
+    pthread_t tid = pthread_self();
+    if (tid == dispatcher_thread.thread_id)
+    {
+        struct event_base *base = c->event.ev_base;
+        if (event_del(&c->event) == -1) return false;    
+        event_set(&c->event, c->sfd, new_flags, master_event_handler, (void *)c);
+        event_base_set(base, &c->event);
+        c->ev_flags = new_flags;
+        if (event_add(&c->event, 0) == -1) return false;
+        return true;
+    }else{
+        struct event_base *base = bufferevent_get_base(c->buf_ev);
+        bufferevent_free(c->buf_ev);
+        c->buf_ev = bufferevent_new(c->sfd, event_handler, event_handler, NULL, (void * )c);
+        bufferevent_base_set(base, c->buf_ev);
+        
+        c->ev_flags = new_flags;
+        if (bufferevent_enable(c->buf_ev, new_flags) == -1) return false;
+        return true;
+    }    
+    //这个也得改成bufferevent的形式
+/*
+
     event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
+    event_add(&c->event, 0);
+
+
+    c->buf_ev = bufferevent_new(c->sfd, event_handler, event_handler, NULL, (void * )c);
+    bufferevent_base_set(base, c->buf_ev);
+    bufferevent_enable(c->buf_ev, new_flags);
+
     c->ev_flags = new_flags;
     if (event_add(&c->event, 0) == -1) return false;
     return true;
+*/
 }
 
 static void conn_close(conn *c) {
@@ -598,8 +660,13 @@ static void conn_close(conn *c) {
     */
     assert(c != NULL);
     /* delete the event, the socket and the conn */
-    event_del(&c->event);
-
+    pthread_t tid = pthread_self();
+    if (tid == dispatcher_thread.thread_id){
+        event_del(&c->event);
+    }else{
+        bufferevent_free(c->buf_ev);
+    }
+    
     fprintf(stderr, "<%d connection closed.\n", c->sfd);
     // conn_cleanup(c);
     // MEMCACHED_CONN_RELEASE(c->sfd);
@@ -614,8 +681,6 @@ static void conn_set_state(conn *c, enum conn_states state) {
     assert(state >= conn_listening && state < conn_max_state);
 
     if (state != c->state) {
-        fprintf(stderr, "error\n");
-
         if (state == conn_write || state == conn_mwrite) {
             // MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
             //i don't know what should be done.
@@ -637,7 +702,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     new_c = conns[sfd];
     if (NULL == new_c)
     {
-        if ( !(c = (conn *)alloc(1, sizeof(conn))) )
+        if ( !(new_c = (conn *)calloc(1, sizeof(conn))) )
         {
             perror("alloc conn fail");
             exit(1);
@@ -647,22 +712,40 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         conns[sfd] = new_c;
     }
 
-    new_c->stats = init_state;
+    new_c->state = init_state;
     //以上是连接的初始化，接下来是连接的事件注册
-    /*
-     event_set(&new_c->event, sfd, event_flags, event_handler, (void*)new_c);
-     event_base_set(base, &new_c->event);
+    
+
+     pthread_t tid = pthread_self();
+     if (tid == dispatcher_thread.thread_id)
+     {
+        event_set(&new_c->event, sfd, event_flags, master_event_handler, (void*)new_c);
+        event_base_set(base, &new_c->event);
+        event_add(&new_c->event, 0);
+     }else{
+        new_c->buf_ev = bufferevent_new(sfd, event_handler, event_handler, buf_error_callback, (void *)new_c);
+        bufferevent_base_set(base, new_c->buf_ev);
+        bufferevent_enable(new_c->buf_ev, event_flags);
+     }
+     
+     
+     /*
      想着想着还是决定改成用bufferevent。
      因为master线程与slave用的是同一个函数来做处理event_handler -> drive_machine，
      所以master线程的accept也需要改为用bufferevent，而且event_handler以及drive_machine也得改
      还有struct conn的event也得改呀，得改成bufferevent类型呢
+
+     草草草！bufferevent在socket还没有连接上的时候是用不了了的，好么！完全不会有什么读写操作，只有error回调
+     查了一个下午好么！！！
      */
-    new_c->buf_ev = bufferevent_new(sfd, event_handler, event_handler, event_handler, (void *)new_c);
-    bufferevent_enable(new_c->buf_ev, event_flags);
+
+     /*
+    new_c->buf_ev = bufferevent_new(sfd, event_handler, event_handler, buf_error_callback, (void *)new_c);
     bufferevent_base_set(base, new_c->buf_ev);
-
+    bufferevent_enable(new_c->buf_ev, event_flags);
+    */
+    
     return new_c;
-
 }
 
 static void conn_init(void) {
@@ -709,7 +792,7 @@ static void stats_init(void) {
        did, so time(0) - time.started is never zero.  if so, things
        like 'settings.oldest_live' which act as booleans as well as
        values are now false in boolean context... */
-    process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;    // stats_prefix_init();
+    // process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;    // stats_prefix_init();
 }
 
 int main(int argc, char** argv){    
@@ -724,16 +807,21 @@ int main(int argc, char** argv){
         server_socket 请求，分发
         注册事件loop
     */
+    int retval;
+    main_base = event_init();
     FILE *portnumber_file = NULL;
     portnumber_file = fopen("/tmp/portnumber.file", "a");
 
     stats_init();
     conn_init();
-    thread_init();
+    thread_init(NUM_OF_THREADS);
 
-    server_socket(SERVER_PORT, tcp_transport, portnumber_file);
+    server_socket("127.0.0.1", SERVER_PORT, tcp_transport, portnumber_file);
 
-    event_base_loop(main_base, 0);
+    if (event_base_loop(main_base, 0) != 0) {
+        retval = EXIT_FAILURE;
+    }
+    return retval;
 
     exit(0);
 
