@@ -350,6 +350,22 @@ void buf_error_callback(struct bufferevent *incoming,
     printf("error %d and %d", sfd, what);
 }
 
+void buf_write_callback(struct bufferevent *incoming,
+                        void *arg)
+{	
+    conn *c;
+    c = (conn*) arg;
+    assert(c != NULL);
+    int fd;
+    fd = (int)bufferevent_getfd(incoming);
+    if (fd != c->sfd){
+		perror("fd != sfd");
+		conn_close(c);
+		return;
+	}
+	drive_machine(c, incoming);
+	return;
+}
 //void drive_machine(conn* c){
 //改成bufferevent之后event_handler和drive_machine都不能幸免需要改参数
 void drive_machine(conn* c, struct bufferevent * incoming){
@@ -389,7 +405,8 @@ void drive_machine(conn* c, struct bufferevent * incoming){
                 req = evbuffer_readline(incoming->input); 
                 if (req == NULL){
                     //conn_set_state(c, conn_closing);
-                    goto set_conn_closing;
+                    //goto set_conn_closing;
+                    conn_set_state(c, conn_waiting);
                     break;    
                 }
                 if(c->req != NULL){
@@ -398,9 +415,13 @@ void drive_machine(conn* c, struct bufferevent * incoming){
                 }
                 c->req = req;
                 conn_set_state(c, conn_mwrite);
+		//if (!update_event(c, EV_WRITE | EV_PERSIST)){
+		//	printf("conn_read update event failed");
+		//	goto set_conn_closing;
+		//}
+		//stop = true;
+		//stop = true;
                 break;
-                //把req存起来哈。。。
-                //先不回复吧。。。。回复在conn_mwrite里面呢..      
                 //evreturn = evbuffer_new();
                 //evbuffer_add_printf(evreturn, "You said %s\n", req);
                // bufferevent_write_buffer(incoming, evreturn);
@@ -414,12 +435,22 @@ void drive_machine(conn* c, struct bufferevent * incoming){
                 //所有的回复到在这个函数进行输出
                 req = c->req;
                 evreturn = evbuffer_new();
-                evbuffer_add_printf(evreturn, "You said %s\n", req);
-                bufferevent_write_buffer(incoming, evreturn);
+	//	bufferevent_setwatermark(incoming, EV_WRITE, 0, 0);
+               int res1 =  evbuffer_add_printf(evreturn, "You said %s\n", req);
+               int res2 =  bufferevent_write_buffer(incoming, evreturn);
+//		int res3 = bufferevent_flush(incoming, EV_WRITE, BEV_FLUSH);
+		int res4 = evbuffer_get_length(incoming->output);
                 evbuffer_free(evreturn);
                 free(req);
+		evreturn = NULL;
+		//int fd = (int)bufferevent_getfd(incoming);
+		//char buf[20];
+		//
+		//sprintf(buf, "You said %s\n", req);
+		//write(fd, buf, 11);
                 c->req = NULL;
                 conn_set_state(c,conn_waiting);
+		stop = true;
                 break;
             case conn_waiting:
                 if (!update_event(c, EV_READ | EV_PERSIST)) {
@@ -625,7 +656,7 @@ static bool update_event(conn *c, const int new_flags) {
     }else{
         struct event_base *base = bufferevent_get_base(c->buf_ev);
         bufferevent_free(c->buf_ev);
-        c->buf_ev = bufferevent_new(c->sfd, event_handler, event_handler, NULL, (void * )c);
+        c->buf_ev = bufferevent_new(c->sfd, event_handler, buf_write_callback, buf_error_callback, (void * )c);
         bufferevent_base_set(base, c->buf_ev);
         
         c->ev_flags = new_flags;
@@ -715,7 +746,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     new_c->state = init_state;
     //以上是连接的初始化，接下来是连接的事件注册
     
-
      pthread_t tid = pthread_self();
      if (tid == dispatcher_thread.thread_id)
      {
@@ -819,6 +849,7 @@ int main(int argc, char** argv){
     server_socket("127.0.0.1", SERVER_PORT, tcp_transport, portnumber_file);
 
     if (event_base_loop(main_base, 0) != 0) {
+	printf("event_base_loop error");
         retval = EXIT_FAILURE;
     }
     return retval;
