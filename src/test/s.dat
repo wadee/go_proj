@@ -1,0 +1,3 @@
+clock_gettime(CLOCK_MONOTONIC, {3983897, 126558108}) = 0
+gettimeofday({1445858772, 470946}, NULL) = 0
+epoll_wait(3,  <detached ...>

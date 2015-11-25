@@ -1,0 +1,8 @@
+clock_gettime(CLOCK_MONOTONIC, {3983784, 279504616}) = 0
+gettimeofday({1445858659, 623892}, NULL) = 0
+epoll_wait(3, {{EPOLLIN, {u32=27, u64=27}}}, 32, -1) = 1
+clock_gettime(CLOCK_MONOTONIC, {3983792, 383164597}) = 0
+gettimeofday({1445858667, 727545}, NULL) = 0
+accept(27, {sa_family=AF_INET, sin_port=htons(58955), sin_addr=inet_addr("127.0.0.1")}, [16]) = 28
+write(8, "c", 1)                        = 1
+epoll_wait(3,  <detached ...>
