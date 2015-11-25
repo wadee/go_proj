@@ -74,7 +74,9 @@ func (this *MyPageProcesser) Process(p *page.Page) {
 		})
 	}
 
-	p.AddField("content", fetch_content)
+	if fetch_content != "" {
+		p.AddField("content", fetch_content)
+	}
 
 }
 
@@ -101,7 +103,7 @@ func main() {
 	for ; err == nil; line, err = br.ReadString('\n') {
 		data := strings.Split(line, "||")
 		url := data[1]
-		urltag := data[0] + "||" + data[2]
+		urltag := data[0] + "||" + strings.Trim(data[2], "\n")
 		urls[url] = urltag
 	}
 
