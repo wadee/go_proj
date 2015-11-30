@@ -4,16 +4,33 @@ import (
 	"errors"
 	"strconv"
 	"time"
+
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
+	"log"
 )
 
 var (
-	UserList map[string]*User
+	db_instance *sql.DB
 )
 
 func init() {
-	UserList = make(map[string]*User)
-	u := User{"user_11111", "astaxie", "11111", Profile{"male", 20, "Singapore", "astaxie@gmail.com"}}
-	UserList["user_11111"] = &u
+	host := beego.AppConfig.String("db_host")
+	port := beego.AppConfig.String("db_port")
+	user := beego.AppConfig.String("db_user")
+	password := beego.AppConfig.String("db_password")
+	database := beego.AppConfig.String("db_database")
+
+	db_instance = connect(host, port, user, password, database)
+}
+
+func connect(host, port, user, password, database string) *sql.DB {
+	conn := user + ":" + password + "@tcp(" + host + ":" + port + ")/" + database + "?charset=utf8"
+	db, err := sql.Open("mysql", conn)
+	if err != nil {
+		panic("db connect fail")
+	}
+	return db
 }
 
 type User struct {
@@ -21,13 +38,6 @@ type User struct {
 	Username string
 	Password string
 	Profile  Profile
-}
-
-type Profile struct {
-	Gender  string
-	Age     int
-	Address string
-	Email   string
 }
 
 func AddUser(u User) string {

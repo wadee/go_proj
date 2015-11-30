@@ -5,6 +5,7 @@
   "permissions": [
     "identity",
     "bookmarks",
+    "storage",
     "http://52.192.188.206:8081/"
   ],
   "browser_action": {

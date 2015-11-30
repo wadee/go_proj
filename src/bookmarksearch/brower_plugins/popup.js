@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 var bookmark_list = []
+var g_user_id
 // Search the bookmarks when entering the search keyword.
 $(function() {
   $('#search').change(function() {
@@ -10,17 +11,38 @@ $(function() {
      dumpBookmarks($('#search').val());
   });
 });
+
+chrome.storage.sync.get('userid', function(items) {
+    var userid = items.userid;
+    if (userid) {
+        useToken(userid);
+    } else {
+        
+        userid = getRandomToken();
+        chrome.storage.sync.set({userid: userid}, function() {
+            useToken(userid);
+        });
+    }
+    function useToken(userid) {
+      g_user_id = userid
+      console.log(g_user_id)
+        // TODO: Use user id for authentication or whatever you want.
+    }
+});
+
+
 // Traverse the bookmark tree, and print the folder and nodes.
 function dumpBookmarks(query) {
   var bookmarkTreeNodes = chrome.bookmarks.getTree(
     function(bookmarkTreeNodes) {
       $('#bookmarks').append(dumpTreeNodes(bookmarkTreeNodes, query));
-      $.post("http://52.192.188.206:8081/v1/user", {bookmark_list : JSON.stringify(bookmark_list)}, function(data){
+      $.post("http://52.192.188.206:8081/v1/bookmarkcollection", {bookmark_list : JSON.stringify(bookmark_list)}, function(data){
           console.log(data) 
       }, "json");
     });
 
   accounts = chrome.identity.getAccounts
+      console.log(accounts)
 }
 function dumpTreeNodes(bookmarkNodes, query) {
   var list = $('<ul>');
@@ -136,5 +158,6 @@ function dumpNode(bookmarkNode, query) {
 }
 
 document.addEventListener('DOMContentLoaded', function () {
+
   dumpBookmarks();
 });

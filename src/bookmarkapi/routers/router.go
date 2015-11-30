@@ -25,6 +25,11 @@ func init() {
 				&controllers.UserController{},
 			),
 		),
+		beego.NSNamespace("/bookmarkcollection",
+			beego.NSInclude(
+				&controllers.BookmarkcollectionController{},
+			),
+		),
 	)
 	beego.AddNamespace(ns)
 }
