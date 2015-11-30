@@ -76,7 +76,7 @@ func indexBookMark() {
 	for docId, bookmark := range bms {
 
 		searcher.IndexDocument(docId, types.DocumentIndexData{
-			Content: bookmark.Title + bookmark.Text,
+			Content: bookmark.Text,
 			Labels:  []string{bookmark.Owner},
 		})
 	}
@@ -115,7 +115,7 @@ func JsonRpcServer(w http.ResponseWriter, req *http.Request) {
 	}
 	response, _ := json.Marshal(&JsonResponse{Docs: docs})
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	io.WriteString(w, string(response))
 }
 

@@ -40,7 +40,7 @@ func main() {
 		if is_http_prefix := strings.HasPrefix(href, "http"); is_http_prefix != true {
 			return
 		}
-		content = "liangzehua" + "||" + href + "||" + s.Text() + "\n"
+		content = "liangzehua" + "||||" + href + "||||" + s.Text() + "\n"
 		fw.WriteString(content)
 	})
 	fmt.Println("done. output file : " + out_file)
