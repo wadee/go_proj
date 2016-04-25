@@ -25,7 +25,7 @@ chrome.storage.sync.get('userid', function(items) {
     }
     function useToken(userid) {
       g_user_id = userid
-      console.log(g_user_id)
+      // console.log(g_user_id)
         // TODO: Use user id for authentication or whatever you want.
     }
 });
@@ -41,8 +41,9 @@ function dumpBookmarks(query) {
       }, "json");
     });
 
-  accounts = chrome.identity.getAccounts
-      console.log(accounts)
+  // accounts = chrome.identity.getAccounts
+  
+      // console.log(accounts)
 }
 function dumpTreeNodes(bookmarkNodes, query) {
   var list = $('<ul>');
