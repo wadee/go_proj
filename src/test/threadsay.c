@@ -765,8 +765,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
      所以master线程的accept也需要改为用bufferevent，而且event_handler以及drive_machine也得改
      还有struct conn的event也得改呀，得改成bufferevent类型呢
 
-     草草草！bufferevent在socket还没有连接上的时候是用不了了的，好么！完全不会有什么读写操作，只有error回调
-     查了一个下午好么！！！
      */
 
      /*
